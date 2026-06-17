@@ -25,15 +25,38 @@ API_KEY = os.getenv("API_FOOTBALL_KEY", "")
 TARGET_LEAGUES = [int(x) for x in os.getenv("TARGET_LEAGUES", "39").split(",") if x.strip()]
 
 
-def _active_season(today: date | None = None) -> int:
-    """Pick the season currently being played (or just-ended).
+# International tournaments (cups) use the tournament year as the season,
+# not the Aug-May convention. Known IDs from api-sports.io:
+#   1  FIFA World Cup
+#   4  UEFA Euro Championship
+#   5  UEFA Nations League
+#   9  Copa America
+#   13 CONMEBOL Libertadores
+#   15 FIFA Club World Cup
+# Domestic leagues use Aug-May. Anything not in this set is treated as Aug-May.
+INTERNATIONAL_LEAGUES: set[int] = {1, 4, 5, 9, 13, 15}
 
-    European leagues run Aug → May. If we're past August, we're in the season
-    that started this calendar year; otherwise we're in the season that
-    started last year.
-    """
+
+def _active_season(today: date | None = None) -> int:
+    """Pick the season currently being played (or just-ended) for an Aug-May league."""
     today = today or date.today()
     return today.year if today.month >= 8 else today.year - 1
+
+
+def _seasons_for_league(league_id: int, today: date | None = None) -> list[int]:
+    """Return the season values to query for a given league.
+
+    Internationals (World Cup, Euros, Nations League, Copa America, etc.)
+    use the tournament's calendar year. Club leagues use the active Aug-May
+    season plus the prior one so the rolling 12-month window is covered.
+    """
+    today = today or date.today()
+    if league_id in INTERNATIONAL_LEAGUES:
+        # Pull current year and last year; covers an in-progress tournament
+        # plus any qualifiers / Nations League matches from the prior cycle.
+        return [today.year, today.year - 1]
+    active = _active_season(today)
+    return [active, active - 1]
 
 
 DEFAULT_SEASON = int(os.getenv("API_FOOTBALL_SEASON", _active_season()))
@@ -209,9 +232,6 @@ def refresh(
 
     db.init_db()
     leagues = leagues or TARGET_LEAGUES
-    if seasons is None:
-        active = _active_season()
-        seasons = [active, active - 1]
 
     today = date.today()
     from_date = (today - timedelta(days=days_back)).isoformat()
@@ -221,12 +241,21 @@ def refresh(
     errors: list[str] = []
     totals = {"fixtures": 0, "stats_pulled": 0}
 
-    log.info("refresh start leagues=%s seasons=%s window=%s..%s", leagues, seasons, from_date, to_date)
+    log.info("refresh start leagues=%s window=%s..%s", leagues, from_date, to_date)
 
     with httpx.Client() as client:
         for league_id in leagues:
-            league_stats = {"fixtures": 0, "stats_pulled": 0, "seasons_queried": []}
-            for season in seasons:
+            # Internationals (World Cup etc.) use the tournament year; club
+            # leagues use the Aug-May active season + prior. Override with
+            # `seasons` if the caller knows better.
+            league_seasons = seasons if seasons is not None else _seasons_for_league(league_id, today)
+            league_stats = {
+                "fixtures": 0,
+                "stats_pulled": 0,
+                "kind": "international" if league_id in INTERNATIONAL_LEAGUES else "club",
+                "seasons_queried": [],
+            }
+            for season in league_seasons:
                 try:
                     fx_resp = _get(
                         client,
@@ -297,9 +326,33 @@ def refresh(
     ok = totals["fixtures"] > 0 or not errors
     return {
         "ok": ok,
-        "seasons": seasons,
+        "seasons_requested": seasons,  # None = auto per-league
         "window": {"from": from_date, "to": to_date},
         "totals": totals,
         "by_league": per_league,
         "errors": errors,
     }
+
+
+def discover_leagues(query: str) -> dict[str, Any]:
+    """Hit /leagues?search=… so the user can find unknown competition IDs."""
+    if not API_KEY:
+        return {"ok": False, "error": "API_FOOTBALL_KEY not set"}
+    with httpx.Client() as client:
+        try:
+            resp = _get(client, "/leagues", {"search": query})
+        except (httpx.HTTPError, APIFootballError) as e:
+            return {"ok": False, "error": str(e)}
+    results = []
+    for item in resp.get("response", []):
+        lg = item.get("league", {}) or {}
+        ctry = item.get("country", {}) or {}
+        seasons = [s.get("year") for s in item.get("seasons", []) if s.get("year")]
+        results.append({
+            "id": lg.get("id"),
+            "name": lg.get("name"),
+            "type": lg.get("type"),  # "League" or "Cup"
+            "country": ctry.get("name"),
+            "seasons": seasons[-5:],  # last few only
+        })
+    return {"ok": True, "count": len(results), "results": results}

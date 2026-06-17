@@ -127,6 +127,12 @@ def ingest_refresh(days_back: int = 365, days_forward: int = 7, fetch_stats: boo
     return {"fixtures": result, "odds": odds_result}
 
 
+@app.get("/leagues/discover")
+def leagues_discover(q: str = Query(min_length=2, description="search e.g. 'world cup'")) -> dict:
+    """Look up league IDs by name. Useful for finding international comps to add to TARGET_LEAGUES."""
+    return ingest.discover_leagues(q)
+
+
 if __name__ == "__main__":
     import uvicorn
 
