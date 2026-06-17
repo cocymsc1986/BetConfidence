@@ -1,6 +1,7 @@
 """API-Football ingestion via RapidAPI / api-sports."""
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import date, timedelta
@@ -11,10 +12,31 @@ import httpx
 from . import db
 
 
+log = logging.getLogger("pitch_edge.ingest")
+if not log.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[ingest] %(message)s"))
+    log.addHandler(h)
+log.setLevel(logging.INFO)
+
+
 API_HOST = os.getenv("API_FOOTBALL_HOST", "v3.football.api-sports.io")
 API_KEY = os.getenv("API_FOOTBALL_KEY", "")
 TARGET_LEAGUES = [int(x) for x in os.getenv("TARGET_LEAGUES", "39").split(",") if x.strip()]
-DEFAULT_SEASON = int(os.getenv("API_FOOTBALL_SEASON", date.today().year))
+
+
+def _active_season(today: date | None = None) -> int:
+    """Pick the season currently being played (or just-ended).
+
+    European leagues run Aug → May. If we're past August, we're in the season
+    that started this calendar year; otherwise we're in the season that
+    started last year.
+    """
+    today = today or date.today()
+    return today.year if today.month >= 8 else today.year - 1
+
+
+DEFAULT_SEASON = int(os.getenv("API_FOOTBALL_SEASON", _active_season()))
 
 
 def _headers() -> dict[str, str]:
@@ -27,10 +49,20 @@ def _headers() -> dict[str, str]:
     return {"x-apisports-key": API_KEY}
 
 
+class APIFootballError(RuntimeError):
+    """Raised when API-Football returns a body-level error envelope."""
+
+
 def _get(client: httpx.Client, path: str, params: dict[str, Any]) -> dict[str, Any]:
     resp = client.get(f"https://{API_HOST}{path}", params=params, headers=_headers(), timeout=30.0)
     resp.raise_for_status()
-    return resp.json()
+    body = resp.json()
+    # API-Football returns HTTP 200 even when something is wrong (bad key, quota,
+    # invalid params). The "errors" field carries those messages.
+    errors = body.get("errors")
+    if errors and (isinstance(errors, dict) and errors or isinstance(errors, list) and errors):
+        raise APIFootballError(f"{path} {params} -> errors={errors}")
+    return body
 
 
 def _last_12_months_range() -> tuple[str, str]:
@@ -66,10 +98,16 @@ def _upsert_referee(conn, name: str | None) -> int | None:
 
 
 def _fixture_to_match_row(fx: dict[str, Any], referee_id: int | None) -> dict[str, Any]:
+    """Row for the initial fixture upsert.
+
+    Note: we deliberately omit home_corners / away_corners here so that a
+    subsequent refresh doesn't wipe the values we filled in from
+    /fixtures/statistics. Those columns default to NULL on first insert and
+    are written by the stats pass via a direct UPDATE.
+    """
     info = fx["fixture"]
     teams = fx["teams"]
     goals = fx.get("goals", {}) or {}
-    score = fx.get("score", {}) or {}
     return {
         "id": info["id"],
         "home_team": teams["home"]["id"],
@@ -77,8 +115,6 @@ def _fixture_to_match_row(fx: dict[str, Any], referee_id: int | None) -> dict[st
         "date": info["date"],
         "league": fx["league"]["id"],
         "referee_id": referee_id,
-        "home_corners": None,
-        "away_corners": None,
         "home_goals": goals.get("home"),
         "away_goals": goals.get("away"),
         "status": info.get("status", {}).get("short"),
@@ -157,78 +193,113 @@ def _persist_player_stats(conn, fixture_id: int, players_payload: list[dict[str,
 def refresh(
     *,
     leagues: list[int] | None = None,
-    season: int = DEFAULT_SEASON,
+    seasons: list[int] | None = None,
     days_back: int = 365,
     days_forward: int = 7,
     fetch_stats: bool = True,
+    max_stats_per_league: int = 200,
 ) -> dict[str, Any]:
-    """Pull fixtures + per-player stats for the configured leagues."""
+    """Pull fixtures + per-player stats for the configured leagues.
+
+    By default we fetch both the active season and the prior one so the rolling
+    12-month window stays covered around the off-season changeover.
+    """
     if not API_KEY:
-        return {"ok": False, "error": "API_FOOTBALL_KEY not set"}
+        return {"ok": False, "error": "API_FOOTBALL_KEY not set — check .env"}
 
     db.init_db()
     leagues = leagues or TARGET_LEAGUES
+    if seasons is None:
+        active = _active_season()
+        seasons = [active, active - 1]
+
     today = date.today()
     from_date = (today - timedelta(days=days_back)).isoformat()
     to_date = (today + timedelta(days=days_forward)).isoformat()
 
-    counts = {"fixtures": 0, "stats_pulled": 0, "errors": 0}
+    per_league: dict[int, dict[str, Any]] = {}
+    errors: list[str] = []
+    totals = {"fixtures": 0, "stats_pulled": 0}
+
+    log.info("refresh start leagues=%s seasons=%s window=%s..%s", leagues, seasons, from_date, to_date)
 
     with httpx.Client() as client:
         for league_id in leagues:
-            try:
-                fx_resp = _get(
-                    client,
-                    "/fixtures",
-                    {"league": league_id, "season": season, "from": from_date, "to": to_date},
-                )
-            except httpx.HTTPError as e:
-                counts["errors"] += 1
-                continue
-
-            fixtures = fx_resp.get("response", [])
-            with db.get_conn() as conn:
-                for fx in fixtures:
-                    _upsert_team(conn, fx["teams"]["home"], league_id)
-                    _upsert_team(conn, fx["teams"]["away"], league_id)
-                    referee_name = fx["fixture"].get("referee")
-                    ref_id = _upsert_referee(conn, referee_name)
-                    row = _fixture_to_match_row(fx, ref_id)
-                    db.upsert(conn, "matches", row, keys=("id",))
-                    counts["fixtures"] += 1
-
-            if not fetch_stats:
-                continue
-
-            # Only pull per-player stats for finished fixtures we haven't enriched yet.
-            with db.get_conn() as conn:
-                finished_ids = [
-                    int(r["id"])
-                    for r in conn.execute(
-                        "SELECT id FROM matches WHERE league = ? AND status = 'FT' "
-                        "AND id NOT IN (SELECT DISTINCT match_id FROM player_match_stats)",
-                        (league_id,),
-                    )
-                ]
-
-            for fx_id in finished_ids:
+            league_stats = {"fixtures": 0, "stats_pulled": 0, "seasons_queried": []}
+            for season in seasons:
                 try:
-                    pls = _get(client, "/fixtures/players", {"fixture": fx_id}).get("response", [])
-                    fxs = _get(client, "/fixtures/statistics", {"fixture": fx_id}).get("response", [])
-                except httpx.HTTPError:
-                    counts["errors"] += 1
-                    time.sleep(0.5)
+                    fx_resp = _get(
+                        client,
+                        "/fixtures",
+                        {"league": league_id, "season": season, "from": from_date, "to": to_date},
+                    )
+                except (httpx.HTTPError, APIFootballError) as e:
+                    msg = f"league {league_id} season {season}: {e}"
+                    log.warning(msg)
+                    errors.append(msg)
+                    continue
+
+                fixtures = fx_resp.get("response", [])
+                league_stats["seasons_queried"].append({"season": season, "fixtures": len(fixtures)})
+                log.info("league=%s season=%s returned %d fixtures", league_id, season, len(fixtures))
+
+                if not fixtures:
                     continue
 
                 with db.get_conn() as conn:
-                    home_c, away_c = _persist_fixture_stats(conn, fx_id, fxs)
-                    if home_c is not None or away_c is not None:
-                        conn.execute(
-                            "UPDATE matches SET home_corners=?, away_corners=? WHERE id=?",
-                            (home_c, away_c, fx_id),
-                        )
-                    _persist_player_stats(conn, fx_id, pls)
-                counts["stats_pulled"] += 1
-                time.sleep(0.2)  # gentle rate-limit
+                    for fx in fixtures:
+                        _upsert_team(conn, fx["teams"]["home"], league_id)
+                        _upsert_team(conn, fx["teams"]["away"], league_id)
+                        ref_id = _upsert_referee(conn, fx["fixture"].get("referee"))
+                        db.upsert(conn, "matches", _fixture_to_match_row(fx, ref_id), keys=("id",))
+                        league_stats["fixtures"] += 1
 
-    return {"ok": True, **counts}
+            if fetch_stats:
+                # Only pull per-player stats for finished fixtures we haven't enriched yet.
+                with db.get_conn() as conn:
+                    finished_ids = [
+                        int(r["id"])
+                        for r in conn.execute(
+                            "SELECT id FROM matches WHERE league = ? AND status = 'FT' "
+                            "AND id NOT IN (SELECT DISTINCT match_id FROM player_match_stats) "
+                            "ORDER BY date DESC LIMIT ?",
+                            (league_id, max_stats_per_league),
+                        )
+                    ]
+                log.info("league=%s enriching %d finished fixtures", league_id, len(finished_ids))
+
+                for fx_id in finished_ids:
+                    try:
+                        pls = _get(client, "/fixtures/players", {"fixture": fx_id}).get("response", [])
+                        fxs = _get(client, "/fixtures/statistics", {"fixture": fx_id}).get("response", [])
+                    except (httpx.HTTPError, APIFootballError) as e:
+                        msg = f"fixture {fx_id}: {e}"
+                        log.warning(msg)
+                        errors.append(msg)
+                        time.sleep(0.5)
+                        continue
+
+                    with db.get_conn() as conn:
+                        home_c, away_c = _persist_fixture_stats(conn, fx_id, fxs)
+                        if home_c is not None or away_c is not None:
+                            conn.execute(
+                                "UPDATE matches SET home_corners=?, away_corners=? WHERE id=?",
+                                (home_c, away_c, fx_id),
+                            )
+                        _persist_player_stats(conn, fx_id, pls)
+                    league_stats["stats_pulled"] += 1
+                    time.sleep(0.2)  # gentle rate-limit
+
+            per_league[league_id] = league_stats
+            totals["fixtures"] += league_stats["fixtures"]
+            totals["stats_pulled"] += league_stats["stats_pulled"]
+
+    ok = totals["fixtures"] > 0 or not errors
+    return {
+        "ok": ok,
+        "seasons": seasons,
+        "window": {"from": from_date, "to": to_date},
+        "totals": totals,
+        "by_league": per_league,
+        "errors": errors,
+    }

@@ -34,6 +34,36 @@ def root() -> dict:
     return {"app": "Pitch Edge", "status": "ok"}
 
 
+@app.get("/debug/status")
+def debug_status() -> dict:
+    """Quick DB row counts + a peek at the most recent fixture and stat row.
+
+    Useful for diagnosing 'no data' — confirms whether ingestion populated anything.
+    """
+    out: dict = {}
+    with db.get_conn() as conn:
+        for table in ("teams", "players", "matches", "player_match_stats", "referees", "odds_cache"):
+            out[table] = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        out["matches_finished"] = conn.execute(
+            "SELECT COUNT(*) AS n FROM matches WHERE status = 'FT'"
+        ).fetchone()["n"]
+        out["matches_with_stats"] = conn.execute(
+            "SELECT COUNT(DISTINCT match_id) AS n FROM player_match_stats"
+        ).fetchone()["n"]
+        last = conn.execute(
+            "SELECT id, date, league, status FROM matches ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        out["latest_match"] = dict(last) if last else None
+        out["env"] = {
+            "API_FOOTBALL_KEY_set": bool(os.getenv("API_FOOTBALL_KEY")),
+            "ODDS_API_KEY_set": bool(os.getenv("ODDS_API_KEY")),
+            "API_FOOTBALL_HOST": os.getenv("API_FOOTBALL_HOST"),
+            "TARGET_LEAGUES": os.getenv("TARGET_LEAGUES"),
+            "active_season": ingest._active_season(),
+        }
+    return out
+
+
 @app.get("/signals")
 def get_signals(match_date: str = Query(default="today")) -> dict:
     date_str = date.today().isoformat() if match_date == "today" else match_date
