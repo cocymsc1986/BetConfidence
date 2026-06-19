@@ -25,11 +25,21 @@ ODDS_KEY = os.getenv("ODDS_API_KEY", "")
 
 # The Odds API uses sport_keys, mapped from our TARGET_LEAGUES.
 SPORT_KEYS = {
+    # Domestic leagues
     39: "soccer_epl",
     140: "soccer_spain_la_liga",
     135: "soccer_italy_serie_a",
     78: "soccer_germany_bundesliga",
     61: "soccer_france_ligue_one",
+    # International tournaments (match the INTERNATIONAL_LEAGUES set in ingest.py).
+    # Without these, odds never attach to international fixtures, so EV stays
+    # null and nothing ever qualifies as a "Best Bet".
+    1: "soccer_fifa_world_cup",
+    4: "soccer_uefa_european_championship",
+    5: "soccer_uefa_nations_league",
+    9: "soccer_conmebol_copa_america",
+    13: "soccer_conmebol_copa_libertadores",
+    15: "soccer_fifa_club_world_cup",
 }
 
 TARGET_LEAGUES = [int(x) for x in os.getenv("TARGET_LEAGUES", "39").split(",") if x.strip()]

@@ -1,7 +1,7 @@
 const BASE = '/api';
 
-async function jsonFetch(path) {
-  const res = await fetch(`${BASE}${path}`);
+async function jsonFetch(path, options) {
+  const res = await fetch(`${BASE}${path}`, options);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
@@ -12,4 +12,10 @@ export const api = {
   upcoming: (days = 7) => jsonFetch(`/matches/upcoming?days=${days}`),
   searchPlayers: (q) => jsonFetch(`/players/search?q=${encodeURIComponent(q)}`),
   playerStats: (id) => jsonFetch(`/player/${id}/stats`),
+  debugStatus: () => jsonFetch('/debug/status'),
+  ingestRefresh: ({ daysBack = 365, daysForward = 7, fetchStats = true } = {}) =>
+    jsonFetch(
+      `/ingest/refresh?days_back=${daysBack}&days_forward=${daysForward}&fetch_stats=${fetchStats}`,
+      { method: 'POST' },
+    ),
 };
