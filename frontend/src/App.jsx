@@ -2,11 +2,13 @@ import { useState } from 'react';
 import Signals from './tabs/Signals.jsx';
 import Fixtures from './tabs/Fixtures.jsx';
 import Player from './tabs/Player.jsx';
+import Admin from './tabs/Admin.jsx';
 
 const TABS = [
   { id: 'signals', label: 'Signals' },
   { id: 'fixtures', label: 'Fixtures' },
   { id: 'player', label: 'Player' },
+  { id: 'admin', label: 'Admin' },
 ];
 
 export default function App() {
@@ -32,6 +34,7 @@ export default function App() {
       {active === 'signals' && <Signals />}
       {active === 'fixtures' && <Fixtures />}
       {active === 'player' && <Player />}
+      {active === 'admin' && <Admin />}
     </div>
   );
 }
