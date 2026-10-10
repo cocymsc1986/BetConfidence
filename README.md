@@ -53,7 +53,7 @@ PITCH_EDGE_DB=/somewhere/persistent/pitch_edge.db
 What the free run gives up compared with **Analyse**: no per-match team history from cups and Europe (league
 matches only), no lineups, and no per-event Odds API markets (BTTS, corners, cards, player props still come from
 API-Football's bulk odds). Stats history fills in over the first days: a year of one league is about 380
-matches, so roughly 9 days at ~85 matches' worth of calls a day, and longer with more leagues. Picks before that
+matches, about 45 matches a day at 2 calls each, so roughly 9 days, and longer with more leagues. Picks before that
 use whatever history has arrived. Keep the database file between runs or every run starts again from nothing.
 Whether the free API-Football key covers the current season is worth checking with `/debug/status` after a run.
 
