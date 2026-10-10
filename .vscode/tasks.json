@@ -1,0 +1,45 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Setup: install dependencies",
+      "detail": "Creates .venv, installs Python + npm packages, and copies .env.example to .env if missing",
+      "type": "shell",
+      "command": "python3 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt pytest && (test -f .env || cp .env.example .env) && cd frontend && npm install",
+      "windows": {
+        "command": "python -m venv .venv; .venv\\Scripts\\pip install -r backend/requirements.txt pytest; if (!(Test-Path .env)) { Copy-Item .env.example .env }; cd frontend; npm install"
+      },
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Check setup",
+      "detail": "Fails fast with a helpful message if setup hasn't been run",
+      "type": "shell",
+      "command": "test -d .venv && test -d frontend/node_modules || { echo 'Run the task \"Setup: install dependencies\" first (Terminal > Run Task).'; exit 1; }; test -f .env || echo 'Warning: no .env file - copy .env.example to .env and add your API keys.'",
+      "windows": {
+        "command": "if (!(Test-Path .venv) -or !(Test-Path frontend/node_modules)) { Write-Host 'Run the task \"Setup: install dependencies\" first (Terminal > Run Task).'; exit 1 }; if (!(Test-Path .env)) { Write-Host 'Warning: no .env file - copy .env.example to .env and add your API keys.' }"
+      },
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "silent", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run tests",
+      "type": "shell",
+      "command": ".venv/bin/python -m pytest backend/tests -q",
+      "windows": { "command": ".venv\\Scripts\\python -m pytest backend/tests -q" },
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Refresh data (needs backend running)",
+      "detail": "POST /ingest/refresh — loads fixtures, history and bulk odds for TARGET_LEAGUES",
+      "type": "shell",
+      "command": "curl -s -X POST http://localhost:8000/ingest/refresh",
+      "windows": { "command": "Invoke-RestMethod -Method Post http://localhost:8000/ingest/refresh | ConvertTo-Json -Depth 6" },
+      "problemMatcher": []
+    }
+  ]
+}

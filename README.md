@@ -43,6 +43,14 @@ uvicorn backend.main:app --reload --port 8000
 cd frontend && npm install && npm run dev   # http://localhost:5173
 ```
 
+### Or in VS Code
+1. Open the folder and install the recommended Python extensions when prompted.
+2. **Terminal → Run Task → Setup: install dependencies**. This creates `.venv`, installs everything and copies `.env.example` to `.env`. Then add your API keys to `.env`.
+3. **Run and Debug → "Pitch Edge: full stack" → F5**. This starts the backend with the debugger attached plus the frontend, and opens the browser.
+   - Other launch options: `Backend (FastAPI)`, `Frontend (Vite)`, `Tests (pytest)`.
+   - Tests also show in the Testing sidebar. The **Refresh data** task calls `/ingest/refresh`.
+   - On Windows, if VS Code doesn't pick up the venv, choose `.venv\Scripts\python.exe` via *Python: Select Interpreter*.
+
 Then use **Admin → Refresh** (or `POST /ingest/refresh`) once to load the fixture list and league history. After that, use **Fixtures → Analyse** for each match you care about.
 
 Tests: `pip install pytest && python -m pytest backend/tests`
