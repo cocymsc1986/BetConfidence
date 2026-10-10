@@ -109,6 +109,14 @@ CREATE TABLE IF NOT EXISTS odds_quotes (
     PRIMARY KEY (match_id, source, bookmaker, market, selection, line, player)
 );
 
+-- Calls made per provider per UTC day, so free-plan quotas can be respected.
+CREATE TABLE IF NOT EXISTS api_usage (
+    day          TEXT NOT NULL,
+    provider     TEXT NOT NULL,
+    calls        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, provider)
+);
+
 CREATE INDEX IF NOT EXISTS idx_matches_date    ON matches(date);
 CREATE INDEX IF NOT EXISTS idx_matches_league  ON matches(league);
 CREATE INDEX IF NOT EXISTS idx_matches_home    ON matches(home_team);
@@ -462,3 +470,28 @@ def best_price(match_id: int, market: str, selection: str, line: float | None = 
             (match_id, market, selection, NO_LINE if line is None else float(line)),
         ).fetchone()
     return float(row["p"]) if row and row["p"] is not None else None
+
+
+# ---------- API usage ----------
+
+def _utc_day() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def api_calls_today(provider: str) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT calls FROM api_usage WHERE day = ? AND provider = ?", (_utc_day(), provider)
+        ).fetchone()
+    return int(row["calls"]) if row else 0
+
+
+def record_api_call(provider: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO api_usage(day, provider, calls) VALUES (?, ?, 1) "
+            "ON CONFLICT(day, provider) DO UPDATE SET calls = calls + 1",
+            (_utc_day(), provider),
+        )

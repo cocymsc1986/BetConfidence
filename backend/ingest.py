@@ -76,6 +76,25 @@ class APIFootballError(RuntimeError):
     """Raised when API-Football returns a body-level error envelope."""
 
 
+class BudgetExhausted(APIFootballError):
+    """Raised instead of making a call once today's API-Football budget is spent."""
+
+
+# Max API-Football calls per UTC day (the free plan allows 100). 0 = no cap.
+DAILY_BUDGET = int(os.getenv("API_FOOTBALL_DAILY_BUDGET", "0") or 0)
+# Daily requests left according to API-Football's own response headers (None until the first call).
+_remaining: int | None = None
+
+
+def calls_left() -> int | None:
+    """Calls we may still make today, or None when there is no cap and no quota header yet."""
+    left = [x for x in (
+        DAILY_BUDGET - db.api_calls_today("api-football") if DAILY_BUDGET else None,
+        _remaining,
+    ) if x is not None]
+    return max(min(left), 0) if left else None
+
+
 # Minimum seconds between API-Football calls. Free plan allows ~10 req/min;
 # paid plans allow hundreds, so lower this if you're on Pro.
 MIN_INTERVAL = float(os.getenv("API_FOOTBALL_MIN_INTERVAL", "0.25"))
@@ -83,12 +102,20 @@ _last_call = 0.0
 
 
 def _get(client: httpx.Client, path: str, params: dict[str, Any]) -> dict[str, Any]:
-    global _last_call
+    global _last_call, _remaining
+    left = calls_left()
+    if left is not None and left <= 0:
+        raise BudgetExhausted(f"{path}: today's API-Football budget is spent")
     wait = MIN_INTERVAL - (time.monotonic() - _last_call)
     if wait > 0:
         time.sleep(wait)
     _last_call = time.monotonic()
     resp = client.get(f"https://{API_HOST}{path}", params=params, headers=_headers(), timeout=30.0)
+    if DAILY_BUDGET:
+        db.record_api_call("api-football")
+    header = resp.headers.get("x-ratelimit-requests-remaining")
+    if header is not None and header.strip().lstrip("-").isdigit():
+        _remaining = int(header)
     resp.raise_for_status()
     body = resp.json()
     # API-Football returns HTTP 200 even when something is wrong (bad key, quota,
@@ -296,6 +323,9 @@ def _enrich_fixtures(client: httpx.Client, fixture_ids: list[int], errors: list[
         try:
             fxs = _get(client, "/fixtures/statistics", {"fixture": fx_id}).get("response", [])
             pls = _get(client, "/fixtures/players", {"fixture": fx_id}).get("response", [])
+        except BudgetExhausted as e:
+            errors.append(str(e))
+            break
         except (httpx.HTTPError, APIFootballError) as e:
             msg = f"fixture {fx_id}: {e}"
             log.warning(msg)
@@ -401,6 +431,31 @@ def refresh(
         "by_league": per_league,
         "errors": errors,
     }
+
+
+def enrich_backlog(leagues: list[int] | None = None, *, keep: int = 0, limit: int = 1000) -> dict[str, Any]:
+    """Pull stats for finished league matches that have none yet, newest first.
+
+    Stops while `keep` calls of today's budget are still left, so a capped
+    (free-plan) daily run fills in history a little each day instead of
+    failing. Each match costs 2 calls.
+    """
+    if not API_KEY:
+        return {"ok": False, "error": "API_FOOTBALL_KEY not set — check .env"}
+    db.init_db()
+    leagues = leagues or TARGET_LEAGUES
+    marks = ",".join("?" for _ in leagues)
+    with db.get_conn() as conn:
+        todo = _unenriched_finished(conn, f"league IN ({marks})", tuple(leagues), limit)
+    left = calls_left()
+    if left is not None:
+        todo = todo[: max((left - keep) // 2, 0)]
+    errors: list[str] = []
+    with httpx.Client() as client:
+        done = _enrich_fixtures(client, todo, errors)
+    with db.get_conn() as conn:
+        backlog = len(_unenriched_finished(conn, f"league IN ({marks})", tuple(leagues), 100000))
+    return {"ok": not errors or done > 0, "enriched": done, "backlog": backlog, "errors": errors}
 
 
 HISTORY_MATCHES = int(os.getenv("HISTORY_MATCHES", "20"))
