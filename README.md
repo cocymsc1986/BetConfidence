@@ -29,6 +29,33 @@ The Pro plan (~$19/month, 7,500/day) is realistic for daily use. The Odds API's 
 pull costs about `markets × regions` credits (~22 with the defaults), so lower `ODDS_API_EVENT_MARKETS` / `ODDS_API_REGIONS`
 to save credits.
 
+## Daily paper picks
+
+`python -m backend.daily` ranks the day's best bets across every fixture in `TARGET_LEAGUES`: model probability
+above 50% and positive edge, top 10, printed as a table (`--json picks.json` saves the full result). It places
+no bets. It is built for API-Football Pro with The Odds API on its free plan:
+
+| Plan | Allowance | What a daily run spends |
+| --- | --- | --- |
+| API-Football Pro | 7,500 calls/day | 2 per league for fixtures, 1–2 per league for every bookmaker's odds on the day's games (1X2, goals, BTTS, corners, cards, scorers), ~4 per fixture for team history and lineups, plus 2 per newly finished match for stats |
+| The Odds API free | 500 credits/month | 2 per league with `ODDS_API_REGIONS=uk` (bulk 1X2 + goals only), so about 60/month per league |
+
+Settings:
+
+```bash
+ODDS_API_REGIONS=uk
+ODDS_API_MIN_REMAINING=20         # leave a few credits for manual Analyse
+PITCH_EDGE_DB=/somewhere/persistent/pitch_edge.db
+```
+
+Compared with **Analyse**, the daily run skips The Odds API's per-event markets (BTTS, corners, cards and player
+props at ~22 credits a match). Those markets are still priced from API-Football's bookmakers. Keep the database
+file between runs so finished matches aren't fetched again.
+
+On API-Football's free plan (100 calls/day), set `API_FOOTBALL_DAILY_BUDGET=95` and `API_FOOTBALL_MIN_INTERVAL=6`.
+The run then skips the per-fixture refresh (league matches only, no lineups) and backfills stats within the cap,
+which takes about 9 days for a year of one league.
+
 ## Setup
 
 ```bash

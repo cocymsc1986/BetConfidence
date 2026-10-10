@@ -372,14 +372,29 @@ def _parse_ts(s: str | None) -> datetime | None:
 
 # ---------------------------------------------------------------- The Odds API
 
+# Credits to leave untouched this month (the free plan has 500). Calls that would
+# dip below this are skipped. Known only after the first call of a run.
+ODDS_API_MIN_REMAINING = int(os.getenv("ODDS_API_MIN_REMAINING", "0") or 0)
+_toa_remaining: int | None = None
+
+
 def _toa_get(client: httpx.Client, path: str, params: dict[str, Any]) -> Any:
+    global _toa_remaining
     resp = client.get(f"{ODDS_HOST}{path}", params={"apiKey": ODDS_KEY, **params}, timeout=30.0)
     if resp.status_code >= 400:
         raise httpx.HTTPStatusError(f"{resp.status_code} {resp.text[:200]}", request=resp.request, response=resp)
     remaining = resp.headers.get("x-requests-remaining")
     if remaining is not None:
         log.info("The Odds API credits remaining: %s", remaining)
+        try:
+            _toa_remaining = int(float(remaining))
+        except ValueError:
+            pass
     return resp.json()
+
+
+def _toa_can_spend(cost: int) -> bool:
+    return _toa_remaining is None or _toa_remaining - cost >= ODDS_API_MIN_REMAINING
 
 
 def refresh_match_odds() -> dict[str, Any]:
@@ -390,11 +405,15 @@ def refresh_match_odds() -> dict[str, Any]:
     db.init_db()
     pulled = skipped = 0
     errors: list[str] = []
+    cost = len(BULK_MARKETS) * len([r for r in ODDS_REGIONS.split(",") if r.strip()])
     with httpx.Client() as client:
         for league_id in TARGET_LEAGUES:
             sport_key = SPORT_KEYS.get(league_id)
             if not sport_key:
                 errors.append(f"no Odds API sport_key mapped for league {league_id}")
+                continue
+            if not _toa_can_spend(cost):
+                errors.append(f"{sport_key}: skipped, would leave fewer than {ODDS_API_MIN_REMAINING} credits this month")
                 continue
             try:
                 events = _toa_get(
@@ -435,8 +454,10 @@ def _refresh_odds_api_event(client: httpx.Client, match: Any) -> dict[str, Any]:
 
     quotes: list[dict[str, Any]] = []
     errors: list[str] = []
-    # Request in one go; if the provider rejects a market for this sport, fall back to one-by-one.
     markets = ["h2h", "totals", *EVENT_MARKETS]
+    if not _toa_can_spend(len(markets) * len([r for r in ODDS_REGIONS.split(",") if r.strip()])):
+        return {"ok": False, "error": f"skipped, would leave fewer than {ODDS_API_MIN_REMAINING} credits this month"}
+    # Request in one go; if the provider rejects a market for this sport, fall back to one-by-one.
     try:
         ev = _toa_get(
             client,
@@ -474,6 +495,46 @@ def _refresh_api_football(client: httpx.Client, match_id: int) -> dict[str, Any]
     quotes, unmapped = normalise_api_football(response)
     n = store_quotes(match_id, "api-football", quotes)
     return {"ok": True, "quotes": n, "unmapped_bets": unmapped}
+
+
+def refresh_api_football_odds_for_date(date_str: str, leagues: list[int] | None = None) -> dict[str, Any]:
+    """Every bookmaker's odds for every fixture on one day, a league at a time.
+
+    One call returns up to 10 fixtures with all their markets (1X2, goals,
+    BTTS, corners, cards, scorers), so a full matchday costs 1-2 calls per
+    league instead of 1+ per fixture.
+    """
+    if not ingest.API_KEY:
+        return {"ok": False, "error": "API_FOOTBALL_KEY not set"}
+    db.init_db()
+    errors: list[str] = []
+    stored: dict[int, int] = {}
+    unknown = 0
+    with httpx.Client() as client:
+        for league_id in leagues or TARGET_LEAGUES:
+            season = ingest._seasons_for_league(league_id, datetime.fromisoformat(date_str).date())[0]
+            page, total = 1, 1
+            while page <= total and page <= 10:
+                try:
+                    body = ingest._get(client, "/odds", {"league": league_id, "season": season, "date": date_str, "page": page})
+                except (httpx.HTTPError, ingest.APIFootballError) as e:
+                    errors.append(f"league {league_id} page {page}: {e}")
+                    break
+                total = int((body.get("paging") or {}).get("total") or 1)
+                page += 1
+                by_fixture: dict[int, list[dict[str, Any]]] = {}
+                for item in body.get("response") or []:
+                    fid = (item.get("fixture") or {}).get("id")
+                    if fid:
+                        by_fixture.setdefault(int(fid), []).append(item)
+                for fid, items in by_fixture.items():
+                    if db.get_match(fid) is None:
+                        unknown += 1
+                        continue
+                    quotes, _ = normalise_api_football(items)
+                    stored[fid] = store_quotes(fid, "api-football", quotes)
+    return {"ok": bool(stored) or not errors, "fixtures": len(stored), "quotes": sum(stored.values()),
+            "unknown_fixtures": unknown, "errors": errors}
 
 
 def refresh_odds_for_match(match_id: int) -> dict[str, Any]:
