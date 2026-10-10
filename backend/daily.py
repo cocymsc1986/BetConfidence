@@ -1,13 +1,14 @@
 """Daily paper-trading run: rank the day's best bets across every target fixture.
 
-Built to fit the free data plans:
+The Odds API is the constrained source: it runs on its free plan (500
+credits/month), so it gets one bulk 1X2 + goals call per league, costing 2
+credits per region, and no per-event calls. Every other market's prices come
+from API-Football's bulk odds for the day (1-2 calls per league).
 
-- API-Football (100 calls/day): one fixtures pull per league season, one bulk
-  odds pull per league for the day, then whatever budget is left goes into
-  backfilling match stats (2 calls a match, newest first). No per-match team
-  history or lineup calls.
-- The Odds API (500 credits/month): one bulk 1X2 + goals call per league,
-  costing 2 credits per region. No per-event calls.
+API-Football on Pro (7,500 calls/day) also refreshes each fixture the way
+Analyse does: both teams' recent matches in all competitions plus lineups.
+Set API_FOOTBALL_DAILY_BUDGET to run on its free plan instead; the run then
+skips the per-fixture refresh and backfills league stats within the cap.
 
 Keep the SQLite file between runs (``PITCH_EDGE_DB``) so the history builds up.
 
@@ -37,6 +38,12 @@ def refresh(date_str: str) -> dict[str, Any]:
     report["fixtures"] = ingest.refresh(days_back=DAYS_BACK, days_forward=2, fetch_stats=False)
     report["api_football_odds"] = odds.refresh_api_football_odds_for_date(date_str)
     report["the_odds_api"] = odds.refresh_match_odds() if odds.ODDS_KEY else {"ok": False, "error": "ODDS_API_KEY not set"}
+    if not ingest.DAILY_BUDGET:
+        report["per_fixture"] = {
+            int(m["id"]): ingest.refresh_for_match(int(m["id"]))
+            for m in db.matches_on(date_str)
+            if m["status"] not in db.FINISHED_STATUSES
+        }
     report["stats_backfill"] = ingest.enrich_backlog(keep=0)
     report["api_football_calls_left"] = ingest.calls_left()
     report["the_odds_api_credits_left"] = odds._toa_remaining
@@ -112,8 +119,10 @@ def _table(out: dict[str, Any]) -> str:
             f"still to backfill: {r['stats_backfill'].get('backlog', '?')}; "
             f"The Odds API credits left: {r['the_odds_api_credits_left']}",
         ]
-        for name in ("fixtures", "api_football_odds", "the_odds_api", "stats_backfill"):
-            res = r.get(name) or {}
+        per_fixture = r.get("per_fixture") or {}
+        sections = {k: r.get(k) or {} for k in ("fixtures", "api_football_odds", "the_odds_api", "stats_backfill")}
+        sections["per_fixture"] = {"errors": [e for res in per_fixture.values() for e in res.get("errors") or []]}
+        for name, res in sections.items():
             errs = res.get("errors") or ([res["error"]] if res.get("error") else [])
             if errs:
                 lines.append(f"{name}: {errs[0][:200]}" + (f" (+{len(errs) - 1} more)" if len(errs) > 1 else ""))

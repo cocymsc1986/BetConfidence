@@ -3,6 +3,7 @@ import httpx
 
 from backend import daily, db, ingest, odds
 from backend.tests.test_odds_value import AF_RESPONSE
+from backend.tests import test_refresh_flow
 from backend.tests.test_refresh_flow import HISTORY, UPCOMING, _players, _stats
 
 calls: list[str] = []
@@ -22,7 +23,7 @@ def handler(request: httpx.Request) -> httpx.Response:
         assert "date" in q and "fixture" not in q
         items = [{**AF_RESPONSE[0], "fixture": {"id": 1}}, {**AF_RESPONSE[0], "fixture": {"id": 999}}]
         return httpx.Response(200, headers=headers, json={"errors": [], "paging": {"current": 1, "total": 1}, "response": items})
-    return httpx.Response(404)
+    return test_refresh_flow.handler(request)  # per-fixture refresh: /fixtures?id|team, lineups
 
 
 def _mock(monkeypatch, budget):
@@ -81,3 +82,14 @@ def test_pick_filters_probability_and_edge(league_db, monkeypatch):
     assert all(p["probability"] > 0.5 and p["edge"] > 0 for p in picks)
     assert [p["value_score"] for p in picks] == sorted((p["value_score"] for p in picks), reverse=True)
     assert "Paper picks" in daily._table({"date": day, "fixtures": 1, "picks": picks, "refresh": None})
+
+
+def test_daily_run_on_pro_refreshes_each_fixture(tmp_db, monkeypatch):
+    _mock(monkeypatch, budget=0)
+    calls.clear()
+    out = daily.run(UPCOMING["fixture"]["date"][:10])
+    r = out["refresh"]
+    assert set(r["per_fixture"]) == {1}
+    assert "/fixtures/lineups" in calls
+    assert r["stats_backfill"]["backlog"] == 0
+    assert calls.count("/fixtures/statistics") == 10  # each history match fetched once, not again by the backfill
