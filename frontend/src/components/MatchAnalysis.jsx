@@ -1,9 +1,27 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { api } from '../api.js';
+import { SortTh, useSort } from './Sortable.jsx';
 
 const pct = (p) => (p == null ? '—' : `${(p * 100).toFixed(1)}%`);
 const odds = (o) => (o == null ? '—' : o.toFixed(2));
 const signed = (v) => (v == null ? '—' : `${v > 0 ? '+' : ''}${(v * 100).toFixed(1)}%`);
+const BET_COLUMNS = {
+  rank: (b) => b.rank,
+  label: (b) => b.label,
+  probability: (b) => b.probability,
+  market_prob: (b) => b.market_prob,
+  fair_odds: (b) => b.fair_odds,
+  best_odds: (b) => b.best_odds,
+  ev: (b) => b.ev,
+  stake: (b) => b.quarter_kelly_stake_pct,
+};
+const MARKET_COLUMNS = {
+  label: (m) => m.label,
+  probability: (m) => m.probability,
+  fair_odds: (m) => m.fair_odds,
+  best_odds: (m) => m.best_odds,
+  ev: (m) => m.ev,
+};
 const evClass = (v) => (v == null ? '' : v > 0.05 ? 'pos' : v > 0 ? 'warn-text' : 'neg');
 
 function Detail({ detail }) {
@@ -20,6 +38,8 @@ function Detail({ detail }) {
 
 function TopBets({ bets }) {
   const [open, setOpen] = useState(null);
+  const ranked = useMemo(() => bets.map((b, i) => ({ ...b, rank: i + 1 })), [bets]);
+  const { sorted, sort, toggle } = useSort(ranked, BET_COLUMNS);
   if (!bets.length) return null;
   return (
     <div className="card">
@@ -28,21 +48,21 @@ function TopBets({ bets }) {
         <table>
           <thead>
             <tr>
-              <th>#</th>
-              <th>Bet</th>
-              <th title="Model probability">Chance</th>
-              <th title="Bookmakers' de-margined consensus">Market</th>
-              <th>Fair</th>
-              <th>Best odds</th>
-              <th title="Model chance × best odds − 1">Edge</th>
-              <th title="Quarter-Kelly stake as % of bankroll">Stake</th>
+              <SortTh col="rank" sort={sort} onSort={toggle}>#</SortTh>
+              <SortTh col="label" sort={sort} onSort={toggle}>Bet</SortTh>
+              <SortTh col="probability" sort={sort} onSort={toggle} title="Model probability">Chance</SortTh>
+              <SortTh col="market_prob" sort={sort} onSort={toggle} title="Bookmakers' de-margined consensus">Market</SortTh>
+              <SortTh col="fair_odds" sort={sort} onSort={toggle}>Fair</SortTh>
+              <SortTh col="best_odds" sort={sort} onSort={toggle}>Best odds</SortTh>
+              <SortTh col="ev" sort={sort} onSort={toggle} title="Model chance × best odds − 1">Edge</SortTh>
+              <SortTh col="stake" sort={sort} onSort={toggle} title="Quarter-Kelly stake as % of bankroll">Stake</SortTh>
             </tr>
           </thead>
           <tbody>
-            {bets.map((b, i) => (
-              <Fragment key={i}>
-                <tr className="clickable" onClick={() => setOpen(open === i ? null : i)}>
-                  <td>{i + 1}</td>
+            {sorted.map((b) => (
+              <Fragment key={b.rank}>
+                <tr className="clickable" onClick={() => setOpen(open === b.rank ? null : b.rank)}>
+                  <td>{b.rank}</td>
                   <td>
                     <strong>{b.label}</strong>
                     {b.reliability < 0.6 && <span className="pill warn small">thin data</span>}
@@ -56,7 +76,7 @@ function TopBets({ bets }) {
                   <td className={evClass(b.ev)}>{signed(b.ev)}</td>
                   <td>{b.quarter_kelly_stake_pct != null ? `${b.quarter_kelly_stake_pct}%` : '—'}</td>
                 </tr>
-                {open === i && (
+                {open === b.rank && (
                   <tr>
                     <td colSpan={8}>
                       <Detail detail={b.detail} />
@@ -75,6 +95,56 @@ function TopBets({ bets }) {
   );
 }
 
+function LikelyValue({ markets }) {
+  const rows = useMemo(() => markets.filter((m) => m.probability > 0.5 && m.ev > 0), [markets]);
+  const { sorted, sort, toggle } = useSort(rows, BET_COLUMNS, { key: 'ev', dir: 'desc' });
+  return (
+    <div className="card">
+      <h3 style={{ marginTop: 0 }}>Likely &amp; value ({rows.length})</h3>
+      <p className="muted" style={{ marginTop: 0 }}>
+        Every selection the model gives more than a 50% chance that also has a positive edge at the best price.
+      </p>
+      {rows.length === 0 ? (
+        <div className="muted">No selection is both more likely than not and priced above its fair odds.</div>
+      ) : (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <SortTh col="label" sort={sort} onSort={toggle}>Bet</SortTh>
+                <SortTh col="probability" sort={sort} onSort={toggle} title="Model probability">Chance</SortTh>
+                <SortTh col="market_prob" sort={sort} onSort={toggle} title="Bookmakers' de-margined consensus">Market</SortTh>
+                <SortTh col="fair_odds" sort={sort} onSort={toggle}>Fair</SortTh>
+                <SortTh col="best_odds" sort={sort} onSort={toggle}>Best odds</SortTh>
+                <SortTh col="ev" sort={sort} onSort={toggle} title="Model chance × best odds − 1">Edge</SortTh>
+                <SortTh col="stake" sort={sort} onSort={toggle} title="Quarter-Kelly stake as % of bankroll">Stake</SortTh>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((b, i) => (
+                <tr key={i}>
+                  <td>
+                    <strong>{b.label}</strong>
+                    {b.reliability < 0.6 && <span className="pill warn small">thin data</span>}
+                  </td>
+                  <td>{pct(b.probability)}</td>
+                  <td>{pct(b.market_prob)}</td>
+                  <td>{odds(b.fair_odds)}</td>
+                  <td>
+                    {odds(b.best_odds)} <span className="muted">{b.bookmaker}</span>
+                  </td>
+                  <td className={evClass(b.ev)}>{signed(b.ev)}</td>
+                  <td>{b.quarter_kelly_stake_pct != null ? `${b.quarter_kelly_stake_pct}%` : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AllMarkets({ markets }) {
   const [category, setCategory] = useState('all');
   const [query, setQuery] = useState('');
@@ -86,6 +156,7 @@ function AllMarkets({ markets }) {
       (!pricedOnly || m.best_odds != null) &&
       (!query || m.label.toLowerCase().includes(query.toLowerCase())),
   );
+  const { sorted, sort, toggle } = useSort(rows, MARKET_COLUMNS);
   return (
     <div className="card">
       <h3 style={{ marginTop: 0 }}>All markets ({markets.length})</h3>
@@ -105,15 +176,15 @@ function AllMarkets({ markets }) {
         <table>
           <thead>
             <tr>
-              <th>Selection</th>
-              <th>Chance</th>
-              <th>Fair</th>
-              <th>Best odds</th>
-              <th>Edge</th>
+              <SortTh col="label" sort={sort} onSort={toggle}>Selection</SortTh>
+              <SortTh col="probability" sort={sort} onSort={toggle}>Chance</SortTh>
+              <SortTh col="fair_odds" sort={sort} onSort={toggle}>Fair</SortTh>
+              <SortTh col="best_odds" sort={sort} onSort={toggle}>Best odds</SortTh>
+              <SortTh col="ev" sort={sort} onSort={toggle}>Edge</SortTh>
             </tr>
           </thead>
           <tbody>
-            {rows.map((m, i) => (
+            {sorted.map((m, i) => (
               <tr key={i}>
                 <td>{m.label}</td>
                 <td>{pct(m.probability)}</td>
@@ -182,6 +253,7 @@ export default function MatchAnalysis({ match, onBack }) {
             <div>Odds updated: <span>{data.odds_updated_at?.slice(0, 16).replace('T', ' ') ?? '—'}</span></div>
           </div>
           <TopBets bets={data.top_bets || []} />
+          <LikelyValue markets={data.markets || []} />
           <AllMarkets markets={data.markets || []} />
           <p className="muted small-print">
             Chance = model probability (player props assume the player features). Edge = chance × best odds − 1.
