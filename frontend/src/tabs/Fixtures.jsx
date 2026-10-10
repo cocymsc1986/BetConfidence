@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import MatchAnalysis from '../components/MatchAnalysis.jsx';
 
 export default function Fixtures() {
   const [matches, setMatches] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [selected, setSelected] = useState(null);
 
   useEffect(() => {
     api
@@ -14,12 +16,13 @@ export default function Fixtures() {
       .finally(() => setLoading(false));
   }, []);
 
+  if (selected) return <MatchAnalysis match={selected} onBack={() => setSelected(null)} />;
   if (loading) return <div className="empty">Loading fixtures…</div>;
   if (error) return <div className="empty">Error: {error}</div>;
-  if (!matches.length) return <div className="empty">No upcoming fixtures cached. Run /ingest/refresh.</div>;
+  if (!matches.length) return <div className="empty">No upcoming fixtures cached. Run a refresh from the Admin tab.</div>;
 
   return (
-    <div className="card">
+    <div className="card table-scroll">
       <table>
         <thead>
           <tr>
@@ -31,6 +34,7 @@ export default function Fixtures() {
             <th>Away</th>
             <th>O2.5</th>
             <th>BTTS</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
@@ -44,6 +48,9 @@ export default function Fixtures() {
               <td>{m.odds?.away_win?.toFixed(2) ?? '—'}</td>
               <td>{m.odds?.over_2_5?.toFixed(2) ?? '—'}</td>
               <td>{m.odds?.btts_yes?.toFixed(2) ?? '—'}</td>
+              <td>
+                <button className="primary" onClick={() => setSelected(m)}>Analyse</button>
+              </td>
             </tr>
           ))}
         </tbody>

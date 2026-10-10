@@ -41,9 +41,9 @@ export default function Signals() {
     () =>
       signals.filter(
         (s) =>
-          (s.confidence ?? 0) >= 0.65 &&
-          (s.odds ?? 0) >= 1.8 &&
-          (s.ev_score ?? 0) > 0.05,
+          (s.value_score ?? 0) > 0.03 &&
+          (s.ev_score ?? 0) > 0.05 &&
+          (s.odds ?? 0) >= 1.5,
       ),
     [signals],
   );
@@ -55,7 +55,7 @@ export default function Signals() {
     <>
       <div className="best-callout">
         <h2>Best Bets · {best.length}</h2>
-        <p>Confidence ≥ 65%, odds ≥ 1.80, EV &gt; 5%</p>
+        <p>Edge &gt; 5% at odds ≥ 1.50, still positive after weighing bookmaker consensus. For one match, use Fixtures → Analyse.</p>
       </div>
 
       {best.slice(0, 5).map((s, i) => (

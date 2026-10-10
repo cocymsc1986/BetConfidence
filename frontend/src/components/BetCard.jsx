@@ -1,5 +1,5 @@
 export default function BetCard({ signal }) {
-  const { market, confidence, odds, ev_score, stat_summary, match_context, player_name, team_name } = signal;
+  const { market, confidence, odds, bookmaker, ev_score, stat_summary, match_context, player_name, team_name } = signal;
   const confPct = confidence != null ? `${Math.round(confidence * 100)}%` : '—';
   const oddsStr = odds != null ? odds.toFixed(2) : '—';
   const evPct = ev_score != null ? `${(ev_score * 100).toFixed(1)}%` : '—';
@@ -20,7 +20,7 @@ export default function BetCard({ signal }) {
       </div>
       <div className="metrics">
         <span className={confPill}>Conf {confPct}</span>
-        <span className="pill">Odds {oddsStr}</span>
+        <span className="pill">Odds {oddsStr}{bookmaker ? ` · ${bookmaker}` : ''}</span>
         <span className={evPill}>EV {evPct}</span>
       </div>
       {stat_summary && (

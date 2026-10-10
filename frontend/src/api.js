@@ -12,6 +12,8 @@ export const api = {
   upcoming: (days = 7) => jsonFetch(`/matches/upcoming?days=${days}`),
   searchPlayers: (q) => jsonFetch(`/players/search?q=${encodeURIComponent(q)}`),
   playerStats: (id) => jsonFetch(`/player/${id}/stats`),
+  analyseMatch: (id, top = 10) => jsonFetch(`/matches/${id}/analyse?top=${top}`, { method: 'POST' }),
+  matchAnalysis: (id, top = 10) => jsonFetch(`/matches/${id}/analysis?top=${top}`),
   debugStatus: () => jsonFetch('/debug/status'),
   ingestRefresh: ({ daysBack = 365, daysForward = 7, fetchStats = true } = {}) =>
     jsonFetch(

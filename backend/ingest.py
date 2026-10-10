@@ -76,21 +76,27 @@ class APIFootballError(RuntimeError):
     """Raised when API-Football returns a body-level error envelope."""
 
 
+# Minimum seconds between API-Football calls. Free plan allows ~10 req/min;
+# paid plans allow hundreds, so lower this if you're on Pro.
+MIN_INTERVAL = float(os.getenv("API_FOOTBALL_MIN_INTERVAL", "0.25"))
+_last_call = 0.0
+
+
 def _get(client: httpx.Client, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    global _last_call
+    wait = MIN_INTERVAL - (time.monotonic() - _last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call = time.monotonic()
     resp = client.get(f"https://{API_HOST}{path}", params=params, headers=_headers(), timeout=30.0)
     resp.raise_for_status()
     body = resp.json()
     # API-Football returns HTTP 200 even when something is wrong (bad key, quota,
     # invalid params). The "errors" field carries those messages.
     errors = body.get("errors")
-    if errors and (isinstance(errors, dict) and errors or isinstance(errors, list) and errors):
+    if errors:  # {} / [] when fine
         raise APIFootballError(f"{path} {params} -> errors={errors}")
     return body
-
-
-def _last_12_months_range() -> tuple[str, str]:
-    today = date.today()
-    return ((today - timedelta(days=365)).isoformat(), today.isoformat())
 
 
 def _upsert_team(conn, t: dict[str, Any], league: int) -> None:
@@ -110,6 +116,8 @@ def _upsert_team(conn, t: dict[str, Any], league: int) -> None:
 
 
 def _upsert_referee(conn, name: str | None) -> int | None:
+    # API-Football is inconsistent: "Michael Oliver" vs "Michael Oliver, England".
+    name = (name or "").split(",")[0].strip()
     if not name:
         return None
     cur = conn.execute("SELECT id FROM referees WHERE name = ?", (name,))
@@ -130,7 +138,11 @@ def _fixture_to_match_row(fx: dict[str, Any], referee_id: int | None) -> dict[st
     """
     info = fx["fixture"]
     teams = fx["teams"]
+    status = (info.get("status") or {}).get("short")
     goals = fx.get("goals", {}) or {}
+    if status in ("AET", "PEN"):
+        # `goals` includes extra time; markets settle on the 90-minute score.
+        goals = ((fx.get("score") or {}).get("fulltime") or goals)
     return {
         "id": info["id"],
         "home_team": teams["home"]["id"],
@@ -140,27 +152,66 @@ def _fixture_to_match_row(fx: dict[str, Any], referee_id: int | None) -> dict[st
         "referee_id": referee_id,
         "home_goals": goals.get("home"),
         "away_goals": goals.get("away"),
-        "status": info.get("status", {}).get("short"),
+        "status": status,
     }
 
 
-def _persist_fixture_stats(conn, fixture_id: int, fixture_stats: list[dict[str, Any]]) -> tuple[int | None, int | None]:
-    """Returns (home_corners, away_corners) from team statistics block."""
-    home_corners = away_corners = None
-    if not fixture_stats:
-        return home_corners, away_corners
-    # First team listed in statistics is home in API-Football's response.
-    for idx, team_block in enumerate(fixture_stats):
-        for s in team_block.get("statistics", []):
-            if s.get("type") == "Corner Kicks":
-                val = s.get("value")
-                if val is None:
-                    continue
-                if idx == 0:
-                    home_corners = int(val)
-                else:
-                    away_corners = int(val)
-    return home_corners, away_corners
+def _stat_int(v: Any) -> int | None:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip().rstrip("%")
+        if not v:
+            return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+# API-Football /fixtures/statistics "type" -> team_match_stats column
+_TEAM_STAT_TYPES = {
+    "Corner Kicks": "corners",
+    "Total Shots": "shots_total",
+    "Shots on Goal": "shots_on_target",
+    "Fouls": "fouls",
+    "Yellow Cards": "yellow_cards",
+    "Red Cards": "red_cards",
+    "Ball Possession": "possession",
+}
+# For these, API-Football reports null rather than 0 when nothing happened.
+_NULL_MEANS_ZERO = {"corners", "yellow_cards", "red_cards"}
+
+
+def _persist_fixture_stats(conn, fixture_id: int, fixture_stats: list[dict[str, Any]]) -> int:
+    """Write per-team stats for a fixture. Returns the number of team rows stored.
+
+    Teams are matched by id: the order of blocks in the response is not guaranteed
+    to be home-then-away, and relying on it silently swaps corners between sides.
+    """
+    stored = 0
+    match = conn.execute("SELECT home_team, away_team FROM matches WHERE id = ?", (fixture_id,)).fetchone()
+    for team_block in fixture_stats or []:
+        team_id = (team_block.get("team") or {}).get("id")
+        stats = team_block.get("statistics") or []
+        if not team_id or not stats:
+            continue
+        row: dict[str, Any] = {"match_id": fixture_id, "team_id": team_id}
+        for s in stats:
+            col = _TEAM_STAT_TYPES.get(s.get("type"))
+            if col:
+                row[col] = _stat_int(s.get("value"))
+        for col in _TEAM_STAT_TYPES.values():
+            row.setdefault(col, None)
+            if row[col] is None and col in _NULL_MEANS_ZERO:
+                row[col] = 0
+        db.upsert(conn, "team_match_stats", row, keys=("match_id", "team_id"))
+        stored += 1
+        if match is not None:
+            side = "home" if team_id == match["home_team"] else "away" if team_id == match["away_team"] else None
+            if side:
+                conn.execute(f"UPDATE matches SET {side}_corners = ? WHERE id = ?", (row["corners"], fixture_id))
+    return stored
 
 
 def _persist_player_stats(conn, fixture_id: int, players_payload: list[dict[str, Any]]) -> None:
@@ -169,28 +220,35 @@ def _persist_player_stats(conn, fixture_id: int, players_payload: list[dict[str,
         for pblk in team_block.get("players", []):
             p = pblk.get("player", {})
             stats_list = pblk.get("statistics") or []
-            if not stats_list:
+            if not stats_list or not p.get("id"):
                 continue
             s = stats_list[0]
             games = s.get("games", {}) or {}
             shots = s.get("shots", {}) or {}
             goals = s.get("goals", {}) or {}
-            passes = s.get("passes", {}) or {}
             cards = s.get("cards", {}) or {}
             fouls = s.get("fouls", {}) or {}
 
-            db.upsert(
-                conn,
-                "players",
-                {
-                    "id": p["id"],
-                    "name": p.get("name", "Unknown"),
-                    "team_id": team_id,
-                    "position": games.get("position"),
-                    "nationality": None,
-                    "age": None,
-                },
-                keys=("id",),
+            conn.execute(
+                """
+                INSERT INTO players (id, name, team_id, position) VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    position = COALESCE(excluded.position, players.position),
+                    -- only move a player to this team if this is their most recent match
+                    team_id = CASE WHEN ? >= COALESCE((
+                        SELECT MAX(m.date) FROM player_match_stats s
+                        JOIN matches m ON m.id = s.match_id WHERE s.player_id = ?
+                    ), '') THEN excluded.team_id ELSE players.team_id END
+                """,
+                (
+                    p["id"],
+                    p.get("name", "Unknown"),
+                    team_id,
+                    games.get("position"),
+                    _fixture_date(conn, fixture_id),
+                    p["id"],
+                ),
             )
             db.upsert(
                 conn,
@@ -198,8 +256,11 @@ def _persist_player_stats(conn, fixture_id: int, players_payload: list[dict[str,
                 {
                     "player_id": p["id"],
                     "match_id": fixture_id,
+                    "team_id": team_id,
+                    "substitute": 1 if games.get("substitute") else 0,
                     "goals": goals.get("total") or 0,
-                    "assists": passes.get("assists") or goals.get("assists") or 0,
+                    # API-Football reports assists under goals.assists.
+                    "assists": goals.get("assists") or 0,
                     "shots_total": shots.get("total") or 0,
                     "shots_on_target": shots.get("on") or 0,
                     "yellow_card": cards.get("yellow") or 0,
@@ -213,6 +274,52 @@ def _persist_player_stats(conn, fixture_id: int, players_payload: list[dict[str,
             )
 
 
+def _fixture_date(conn, fixture_id: int) -> str:
+    row = conn.execute("SELECT date FROM matches WHERE id = ?", (fixture_id,)).fetchone()
+    return row["date"] if row else ""
+
+
+def _store_fixtures(conn, fixtures: list[dict[str, Any]], league_hint: int | None = None) -> int:
+    for fx in fixtures:
+        league_id = (fx.get("league") or {}).get("id") or league_hint
+        _upsert_team(conn, fx["teams"]["home"], league_id)
+        _upsert_team(conn, fx["teams"]["away"], league_id)
+        ref_id = _upsert_referee(conn, fx["fixture"].get("referee"))
+        db.upsert(conn, "matches", _fixture_to_match_row(fx, ref_id), keys=("id",))
+    return len(fixtures)
+
+
+def _enrich_fixtures(client: httpx.Client, fixture_ids: list[int], errors: list[str]) -> int:
+    """Pull /fixtures/statistics + /fixtures/players for each finished fixture. Returns count enriched."""
+    done = 0
+    for fx_id in fixture_ids:
+        try:
+            fxs = _get(client, "/fixtures/statistics", {"fixture": fx_id}).get("response", [])
+            pls = _get(client, "/fixtures/players", {"fixture": fx_id}).get("response", [])
+        except (httpx.HTTPError, APIFootballError) as e:
+            msg = f"fixture {fx_id}: {e}"
+            log.warning(msg)
+            errors.append(msg)
+            continue
+        with db.get_conn() as conn:
+            _persist_fixture_stats(conn, fx_id, fxs)
+            _persist_player_stats(conn, fx_id, pls)
+        done += 1
+    return done
+
+
+def _unenriched_finished(conn, where: str, params: tuple, limit: int) -> list[int]:
+    return [
+        int(r["id"])
+        for r in conn.execute(
+            f"SELECT id FROM matches WHERE {where} AND status IN {db._FINISHED_SQL} "
+            "AND id NOT IN (SELECT match_id FROM team_match_stats) "
+            "ORDER BY date DESC LIMIT ?",
+            (*params, limit),
+        )
+    ]
+
+
 def refresh(
     *,
     leagues: list[int] | None = None,
@@ -222,7 +329,7 @@ def refresh(
     fetch_stats: bool = True,
     max_stats_per_league: int = 200,
 ) -> dict[str, Any]:
-    """Pull fixtures + per-player stats for the configured leagues.
+    """Pull fixtures + per-team/per-player stats for the configured leagues.
 
     By default we fetch both the active season and the prior one so the rolling
     12-month window stays covered around the off-season changeover.
@@ -271,53 +378,15 @@ def refresh(
                 fixtures = fx_resp.get("response", [])
                 league_stats["seasons_queried"].append({"season": season, "fixtures": len(fixtures)})
                 log.info("league=%s season=%s returned %d fixtures", league_id, season, len(fixtures))
-
-                if not fixtures:
-                    continue
-
-                with db.get_conn() as conn:
-                    for fx in fixtures:
-                        _upsert_team(conn, fx["teams"]["home"], league_id)
-                        _upsert_team(conn, fx["teams"]["away"], league_id)
-                        ref_id = _upsert_referee(conn, fx["fixture"].get("referee"))
-                        db.upsert(conn, "matches", _fixture_to_match_row(fx, ref_id), keys=("id",))
-                        league_stats["fixtures"] += 1
+                if fixtures:
+                    with db.get_conn() as conn:
+                        league_stats["fixtures"] += _store_fixtures(conn, fixtures, league_id)
 
             if fetch_stats:
-                # Only pull per-player stats for finished fixtures we haven't enriched yet.
                 with db.get_conn() as conn:
-                    finished_ids = [
-                        int(r["id"])
-                        for r in conn.execute(
-                            "SELECT id FROM matches WHERE league = ? AND status = 'FT' "
-                            "AND id NOT IN (SELECT DISTINCT match_id FROM player_match_stats) "
-                            "ORDER BY date DESC LIMIT ?",
-                            (league_id, max_stats_per_league),
-                        )
-                    ]
+                    finished_ids = _unenriched_finished(conn, "league = ?", (league_id,), max_stats_per_league)
                 log.info("league=%s enriching %d finished fixtures", league_id, len(finished_ids))
-
-                for fx_id in finished_ids:
-                    try:
-                        pls = _get(client, "/fixtures/players", {"fixture": fx_id}).get("response", [])
-                        fxs = _get(client, "/fixtures/statistics", {"fixture": fx_id}).get("response", [])
-                    except (httpx.HTTPError, APIFootballError) as e:
-                        msg = f"fixture {fx_id}: {e}"
-                        log.warning(msg)
-                        errors.append(msg)
-                        time.sleep(0.5)
-                        continue
-
-                    with db.get_conn() as conn:
-                        home_c, away_c = _persist_fixture_stats(conn, fx_id, fxs)
-                        if home_c is not None or away_c is not None:
-                            conn.execute(
-                                "UPDATE matches SET home_corners=?, away_corners=? WHERE id=?",
-                                (home_c, away_c, fx_id),
-                            )
-                        _persist_player_stats(conn, fx_id, pls)
-                    league_stats["stats_pulled"] += 1
-                    time.sleep(0.2)  # gentle rate-limit
+                league_stats["stats_pulled"] = _enrich_fixtures(client, finished_ids, errors)
 
             per_league[league_id] = league_stats
             totals["fixtures"] += league_stats["fixtures"]
@@ -332,6 +401,79 @@ def refresh(
         "by_league": per_league,
         "errors": errors,
     }
+
+
+HISTORY_MATCHES = int(os.getenv("HISTORY_MATCHES", "20"))
+
+
+def refresh_for_match(match_id: int, *, history: int | None = None) -> dict[str, Any]:
+    """Bring everything needed to analyse one fixture up to date.
+
+    - re-reads the fixture itself (status, referee appointment)
+    - pulls each team's last `history` finished matches in *any* competition
+      (league, cups, Europe, internationals) and enriches any without stats
+    - pulls confirmed lineups when published (~20-40 min before kick-off)
+
+    Costs roughly 4 + 2 x (new finished matches) API-Football calls; once a
+    team's history is cached, a re-run costs ~4 calls.
+    """
+    if not API_KEY:
+        return {"ok": False, "error": "API_FOOTBALL_KEY not set — check .env"}
+    history = history or HISTORY_MATCHES
+    db.init_db()
+    m = db.get_match(match_id)
+    if m is None:
+        return {"ok": False, "error": f"match {match_id} not in database — run /ingest/refresh first"}
+
+    errors: list[str] = []
+    out: dict[str, Any] = {"ok": True, "match_id": match_id, "teams": {}, "lineups": False, "errors": errors}
+    with httpx.Client() as client:
+        try:
+            fx = _get(client, "/fixtures", {"id": match_id}).get("response", [])
+            with db.get_conn() as conn:
+                _store_fixtures(conn, fx)
+        except (httpx.HTTPError, APIFootballError) as e:
+            errors.append(f"fixture {match_id}: {e}")
+
+        for side in ("home_team", "away_team"):
+            team_id = int(m[side])
+            try:
+                fx = _get(client, "/fixtures", {"team": team_id, "last": history}).get("response", [])
+            except (httpx.HTTPError, APIFootballError) as e:
+                errors.append(f"team {team_id} history: {e}")
+                continue
+            with db.get_conn() as conn:
+                _store_fixtures(conn, fx)
+                ids = [int(f["fixture"]["id"]) for f in fx]
+                marks = ",".join("?" for _ in ids) or "NULL"
+                todo = _unenriched_finished(conn, f"id IN ({marks})", tuple(ids), history)
+            enriched = _enrich_fixtures(client, todo, errors)
+            out["teams"][team_id] = {"history_fixtures": len(fx), "newly_enriched": enriched}
+
+        try:
+            lineups = _get(client, "/fixtures/lineups", {"fixture": match_id}).get("response", [])
+            if lineups:
+                with db.get_conn() as conn:
+                    _persist_lineups(conn, match_id, lineups)
+                out["lineups"] = True
+        except (httpx.HTTPError, APIFootballError) as e:
+            errors.append(f"lineups {match_id}: {e}")
+    out["ok"] = not errors or bool(out["teams"])
+    return out
+
+
+def _persist_lineups(conn, match_id: int, lineups: list[dict[str, Any]]) -> None:
+    conn.execute("DELETE FROM lineups WHERE match_id = ?", (match_id,))
+    for block in lineups:
+        team_id = (block.get("team") or {}).get("id")
+        for key, starter in (("startXI", 1), ("substitutes", 0)):
+            for entry in block.get(key) or []:
+                pid = (entry.get("player") or {}).get("id")
+                if pid and team_id:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO lineups(match_id, team_id, player_id, starter) VALUES (?,?,?,?)",
+                        (match_id, team_id, pid, starter),
+                    )
 
 
 def discover_leagues(query: str) -> dict[str, Any]:
