@@ -1,12 +1,25 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import MatchAnalysis from '../components/MatchAnalysis.jsx';
+import { SortTh, useSort } from '../components/Sortable.jsx';
+
+const COLUMNS = {
+  date: (m) => m.date,
+  match: (m) => `${m.home_name} vs ${m.away_name}`,
+  referee: (m) => m.referee_name,
+  home_win: (m) => m.odds?.home_win,
+  draw: (m) => m.odds?.draw,
+  away_win: (m) => m.odds?.away_win,
+  over_2_5: (m) => m.odds?.over_2_5,
+  btts_yes: (m) => m.odds?.btts_yes,
+};
 
 export default function Fixtures() {
   const [matches, setMatches] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
+  const { sorted, sort, toggle } = useSort(matches, COLUMNS);
 
   useEffect(() => {
     api
@@ -26,19 +39,19 @@ export default function Fixtures() {
       <table>
         <thead>
           <tr>
-            <th>Date</th>
-            <th>Match</th>
-            <th>Referee</th>
-            <th>Home</th>
-            <th>Draw</th>
-            <th>Away</th>
-            <th>O2.5</th>
-            <th>BTTS</th>
+            <SortTh col="date" sort={sort} onSort={toggle}>Date</SortTh>
+            <SortTh col="match" sort={sort} onSort={toggle}>Match</SortTh>
+            <SortTh col="referee" sort={sort} onSort={toggle}>Referee</SortTh>
+            <SortTh col="home_win" sort={sort} onSort={toggle}>Home</SortTh>
+            <SortTh col="draw" sort={sort} onSort={toggle}>Draw</SortTh>
+            <SortTh col="away_win" sort={sort} onSort={toggle}>Away</SortTh>
+            <SortTh col="over_2_5" sort={sort} onSort={toggle}>O2.5</SortTh>
+            <SortTh col="btts_yes" sort={sort} onSort={toggle}>BTTS</SortTh>
             <th></th>
           </tr>
         </thead>
         <tbody>
-          {matches.map((m) => (
+          {sorted.map((m) => (
             <tr key={m.id}>
               <td>{m.date?.slice(0, 16).replace('T', ' ')}</td>
               <td>{m.home_name} vs {m.away_name}</td>

@@ -208,3 +208,20 @@ button.link { background: transparent; border: 0; color: var(--muted); cursor: p
   margin-bottom: 10px;
   font-size: 14px;
 }
+
+/* ---- sortable headers ---- */
+.sort-btn {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.sort-btn:hover, th.sorted { color: var(--text); }
+.sort-arrow { font-size: 10px; opacity: 0.45; }
+th.sorted .sort-arrow { opacity: 1; }

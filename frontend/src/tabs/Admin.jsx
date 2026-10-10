@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api.js';
+import { SortTh, useSort } from '../components/Sortable.jsx';
 
 function StatusGrid({ status }) {
   if (!status) return null;
@@ -38,6 +39,46 @@ function StatusGrid({ status }) {
   );
 }
 
+const LEAGUE_COLUMNS = {
+  id: (l) => Number(l.id),
+  kind: (l) => l.kind,
+  fixtures: (l) => l.fixtures,
+  stats_pulled: (l) => l.stats_pulled,
+};
+
+function LeagueTable({ byLeague }) {
+  const rows = useMemo(() => Object.entries(byLeague).map(([id, l]) => ({ ...l, id })), [byLeague]);
+  const { sorted, sort, toggle } = useSort(rows, LEAGUE_COLUMNS);
+  return (
+    <table style={{ marginTop: 12 }}>
+      <thead>
+        <tr>
+          <SortTh col="id" sort={sort} onSort={toggle}>League</SortTh>
+          <SortTh col="kind" sort={sort} onSort={toggle}>Kind</SortTh>
+          <SortTh col="fixtures" sort={sort} onSort={toggle}>Fixtures</SortTh>
+          <SortTh col="stats_pulled" sort={sort} onSort={toggle}>Stats</SortTh>
+          <th>Seasons queried</th>
+        </tr>
+      </thead>
+      <tbody>
+        {sorted.map((l) => (
+          <tr key={l.id}>
+            <td>{l.id}</td>
+            <td>{l.kind}</td>
+            <td>{l.fixtures}</td>
+            <td>{l.stats_pulled}</td>
+            <td>
+              {(l.seasons_queried || [])
+                .map((s) => `${s.season} (${s.fixtures})`)
+                .join(', ') || '—'}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function IngestResult({ result }) {
   if (!result) return null;
   const fixtures = result.fixtures || {};
@@ -55,32 +96,7 @@ function IngestResult({ result }) {
       </div>
 
       {Object.keys(byLeague).length > 0 && (
-        <table style={{ marginTop: 12 }}>
-          <thead>
-            <tr>
-              <th>League</th>
-              <th>Kind</th>
-              <th>Fixtures</th>
-              <th>Stats</th>
-              <th>Seasons queried</th>
-            </tr>
-          </thead>
-          <tbody>
-            {Object.entries(byLeague).map(([id, l]) => (
-              <tr key={id}>
-                <td>{id}</td>
-                <td>{l.kind}</td>
-                <td>{l.fixtures}</td>
-                <td>{l.stats_pulled}</td>
-                <td>
-                  {(l.seasons_queried || [])
-                    .map((s) => `${s.season} (${s.fixtures})`)
-                    .join(', ') || '—'}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <LeagueTable byLeague={byLeague} />
       )}
 
       {errors.length > 0 && (

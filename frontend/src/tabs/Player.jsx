@@ -1,6 +1,50 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import BetCard from '../components/BetCard.jsx';
+import { SortTh, useSort } from '../components/Sortable.jsx';
+
+const HISTORY_COLUMNS = [
+  ['date', 'Date', (m) => m.date],
+  ['match', 'Match', (m) => `${m.home_name} vs ${m.away_name}`],
+  ['minutes_played', 'Min'],
+  ['goals', 'G'],
+  ['assists', 'A'],
+  ['shots_on_target', 'SoT'],
+  ['shots_total', 'Sh'],
+  ['fouls_committed', 'FC'],
+  ['fouls_drawn', 'FD'],
+  ['yellow_card', 'YC'],
+  ['red_card', 'RC'],
+];
+const HISTORY_SORT = Object.fromEntries(HISTORY_COLUMNS.map(([k, , get]) => [k, get || ((m) => m[k])]));
+
+function MatchHistory({ matches }) {
+  const { sorted, sort, toggle } = useSort(matches, HISTORY_SORT);
+  return (
+    <div className="card table-scroll">
+      <table>
+        <thead>
+          <tr>
+            {HISTORY_COLUMNS.map(([k, label]) => (
+              <SortTh key={k} col={k} sort={sort} onSort={toggle}>{label}</SortTh>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((m) => (
+            <tr key={m.match_id}>
+              <td>{m.date?.slice(0, 10)}</td>
+              <td>{m.home_name} vs {m.away_name}</td>
+              {HISTORY_COLUMNS.slice(2).map(([k]) => (
+                <td key={k}>{m[k]}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 export default function Player() {
   const [query, setQuery] = useState('');
@@ -79,42 +123,7 @@ export default function Player() {
           {stats?.matches?.length > 0 && (
             <>
               <h3>Match History</h3>
-              <div className="card">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Date</th>
-                      <th>Match</th>
-                      <th>Min</th>
-                      <th>G</th>
-                      <th>A</th>
-                      <th>SoT</th>
-                      <th>Sh</th>
-                      <th>FC</th>
-                      <th>FD</th>
-                      <th>YC</th>
-                      <th>RC</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stats.matches.map((m) => (
-                      <tr key={m.match_id}>
-                        <td>{m.date?.slice(0, 10)}</td>
-                        <td>{m.home_name} vs {m.away_name}</td>
-                        <td>{m.minutes_played}</td>
-                        <td>{m.goals}</td>
-                        <td>{m.assists}</td>
-                        <td>{m.shots_on_target}</td>
-                        <td>{m.shots_total}</td>
-                        <td>{m.fouls_committed}</td>
-                        <td>{m.fouls_drawn}</td>
-                        <td>{m.yellow_card}</td>
-                        <td>{m.red_card}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <MatchHistory matches={stats.matches} />
             </>
           )}
 
