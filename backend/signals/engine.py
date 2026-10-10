@@ -1,96 +1,69 @@
-"""Runs all market signal calculators, attaches odds + EV, returns a ranked list."""
+"""Signals feed for the Signals / Player tabs, backed by the match models in backend/model.
+
+Each signal keeps the original shape: {market, confidence, odds, ev_score,
+stat_summary, match_context, player_name, team_name}.
+"""
 from __future__ import annotations
 
 from typing import Any
 
-from .. import db
-from . import btts, cards_over, corners, goalscorer, yellow_card
+from .. import db, value
+from ..model import markets
 
 
-# Maps internal signal market name -> (odds_cache market key, optional selection prefix matcher)
-ODDS_LOOKUP: dict[str, tuple[str, str | None]] = {
-    "BTTS Yes": ("btts", "Yes"),
-    "Over 2.5 Goals": ("totals", "Over|2.5"),
-    "Over 9.5 Corners": ("alternate_totals_corners", "Over|9.5"),
-    "Over 3.5 Cards": ("alternate_totals_cards", "Over|3.5"),
-    "Anytime Goalscorer": ("player_goal_scorer_anytime", None),
-    "Anytime Assist": ("player_assist_anytime", None),
-    "Player Yellow Card": ("player_card_yellow", None),
-}
+def _signal(p: dict[str, Any], match, team_names: dict[int, str]) -> dict[str, Any]:
+    return {
+        "market": p["label"] if not p["player"] else p["label"].replace(p["player"], "").strip(),
+        "market_key": p["market"],
+        "selection": p["selection"],
+        "line": p["line"],
+        "match_id": match["id"],
+        "player_id": p["player_id"],
+        "player_name": p["player"],
+        "team_name": team_names.get(p["team_id"]) if p["team_id"] else None,
+        "confidence": p["probability"],
+        "fair_odds": p["fair_odds"],
+        "odds": p["best_odds"],
+        "bookmaker": p["bookmaker"],
+        "ev_score": p["ev"],
+        "value_score": p["value_score"],
+        "stat_summary": p["detail"],
+        "match_context": {
+            "match_id": match["id"],
+            "home_team": match["home_team"],
+            "away_team": match["away_team"],
+            "home_name": match["home_name"],
+            "away_name": match["away_name"],
+            "date": match["date"],
+            "referee": match["referee_name"],
+        },
+    }
 
 
-def _attach_odds(signal: dict[str, Any]) -> dict[str, Any]:
-    market_name = signal["market"]
-    cache_key, selection = ODDS_LOOKUP.get(market_name, (None, None))
-    odds = None
-    if cache_key:
-        odds = db.get_odds(signal["match_id"], cache_key, selection)
-    signal["odds"] = odds
-    if odds and signal.get("confidence") is not None:
-        signal["ev_score"] = round(signal["confidence"] * odds - 1, 4)
-    else:
-        signal["ev_score"] = None
-    return signal
+def _sort_key(s: dict[str, Any]) -> tuple:
+    has_ev = s.get("value_score") is not None
+    return (0 if has_ev else 1, -(s.get("value_score") or 0.0), -(s.get("confidence") or 0.0))
 
 
-def _match_level_signals(match_row) -> list[dict[str, Any]]:
+def signals_for_matches(matches, player_id: int | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for fn in (
-        lambda: btts.btts(match_row["id"], match_row["home_team"], match_row["away_team"]),
-        lambda: btts.over_2_5(match_row["id"], match_row["home_team"], match_row["away_team"]),
-        lambda: corners.over_9_5(match_row["id"], match_row["home_team"], match_row["away_team"]),
-        lambda: cards_over.over_3_5_cards(
-            match_row["id"], match_row["home_team"], match_row["away_team"], match_row["referee_id"]
-        ),
-    ):
-        sig = fn()
-        if sig:
-            out.append(sig)
-    return out
-
-
-def _player_signals(match_row, players) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for p in players:
-        for sig in (
-            yellow_card.calculate(p["id"], match_row["id"], match_row["referee_id"]),
-            goalscorer.goalscorer(p["id"], match_row["id"]),
-            goalscorer.assist(p["id"], match_row["id"]),
-        ):
-            if not sig:
-                continue
-            sig["player_name"] = p["name"]
-            sig["team_name"] = p["team_name"]
-            out.append(sig)
-    return out
-
-
-def signals_for_matches(matches) -> list[dict[str, Any]]:
-    all_signals: list[dict[str, Any]] = []
     for m in matches:
-        ctx = {
-            "match_id": m["id"],
-            "home_team": m["home_team"],
-            "away_team": m["away_team"],
-            "home_name": m["home_name"],
-            "away_name": m["away_name"],
-            "date": m["date"],
-            "referee": m["referee_name"],
-        }
-        match_sigs = _match_level_signals(m)
-        players = db.players_for_match(m["id"])
-        player_sigs = _player_signals(m, players)
-        for sig in match_sigs + player_sigs:
-            sig["match_context"] = ctx
-            all_signals.append(_attach_odds(sig))
-
-    # Rank: signals with EV first (descending), then by raw confidence.
-    def sort_key(s: dict[str, Any]) -> tuple[int, float, float]:
-        has_ev = 1 if s.get("ev_score") is not None else 0
-        return (-has_ev, -(s.get("ev_score") or 0.0), -(s.get("confidence") or 0.0))
-
-    all_signals.sort(key=sort_key)
-    return all_signals
+        model = markets.predict_match(m)
+        preds = model["predictions"]
+        if player_id is not None:
+            preds = [p for p in preds if p["player_id"] == player_id]
+        priced = value.price_predictions(preds, db.odds_for_match(m["id"]))
+        names = {m["home_team"]: m["home_name"], m["away_team"]: m["away_name"]}
+        # Keep the feed readable: only the "over/yes" side of each market, and only
+        # selections that are reasonably likely or priced.
+        for p in priced:
+            if p["selection"] in ("under", "no") and p["value_score"] is None:
+                continue
+            if p["probability"] < 0.3 and p["value_score"] is None:
+                continue
+            out.append(_signal(p, m, names))
+    out.sort(key=_sort_key)
+    return out
 
 
 def signals_for_date(date_str: str) -> list[dict[str, Any]]:
@@ -98,40 +71,11 @@ def signals_for_date(date_str: str) -> list[dict[str, Any]]:
 
 
 def signals_for_player(player_id: int) -> list[dict[str, Any]]:
-    with db.get_conn() as conn:
-        upcoming = list(
-            conn.execute(
-                """
-                SELECT m.*, ht.name AS home_name, at.name AS away_name, r.name AS referee_name
-                FROM matches m
-                JOIN teams ht ON ht.id = m.home_team
-                JOIN teams at ON at.id = m.away_team
-                LEFT JOIN referees r ON r.id = m.referee_id
-                JOIN players p ON p.id = ?
-                WHERE (m.home_team = p.team_id OR m.away_team = p.team_id)
-                  AND date(m.date) >= date('now')
-                ORDER BY m.date ASC
-                LIMIT 5
-                """,
-                (player_id,),
-            )
-        )
-    all_signals: list[dict[str, Any]] = []
-    for m in upcoming:
-        ctx = {
-            "match_id": m["id"],
-            "home_name": m["home_name"],
-            "away_name": m["away_name"],
-            "date": m["date"],
-            "referee": m["referee_name"],
-        }
-        for sig in (
-            yellow_card.calculate(player_id, m["id"], m["referee_id"]),
-            goalscorer.goalscorer(player_id, m["id"]),
-            goalscorer.assist(player_id, m["id"]),
-        ):
-            if sig:
-                sig["match_context"] = ctx
-                all_signals.append(_attach_odds(sig))
-    all_signals.sort(key=lambda s: -(s.get("ev_score") or 0.0))
-    return all_signals
+    player = db.get_player(player_id)
+    if player is None or player["team_id"] is None:
+        return []
+    upcoming = [
+        m for m in db.upcoming_matches(days=14)
+        if player["team_id"] in (m["home_team"], m["away_team"])
+    ][:3]
+    return signals_for_matches(upcoming, player_id=player_id)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
 
@@ -11,10 +12,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from . import db, ingest, odds
+from . import analysis, db, ingest, odds
 from .signals import engine
 
-app = FastAPI(title="Pitch Edge", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    db.init_db()
+    yield
+
+
+app = FastAPI(title="Pitch Edge", version="0.2.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,11 +30,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    db.init_db()
 
 
 @app.get("/")
@@ -42,10 +45,12 @@ def debug_status() -> dict:
     """
     out: dict = {}
     with db.get_conn() as conn:
-        for table in ("teams", "players", "matches", "player_match_stats", "referees", "odds_cache"):
+        for table in ("teams", "players", "matches", "team_match_stats", "player_match_stats", "referees", "odds_quotes"):
             out[table] = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        # Kept for the Admin tab, which predates odds_quotes.
+        out["odds_cache"] = out["odds_quotes"]
         out["matches_finished"] = conn.execute(
-            "SELECT COUNT(*) AS n FROM matches WHERE status = 'FT'"
+            f"SELECT COUNT(*) AS n FROM matches WHERE status IN {db._FINISHED_SQL}"
         ).fetchone()["n"]
         out["matches_with_stats"] = conn.execute(
             "SELECT COUNT(DISTINCT match_id) AS n FROM player_match_stats"
@@ -77,9 +82,9 @@ def get_best_signals(match_date: str = Query(default="today")) -> dict:
     signals = engine.signals_for_date(date_str)
     best = [
         s for s in signals
-        if (s.get("confidence") or 0) >= 0.65
-        and (s.get("odds") or 0) >= 1.8
+        if (s.get("value_score") or 0) > 0.03
         and (s.get("ev_score") or 0) > 0.05
+        and (s.get("odds") or 0) >= 1.5
     ]
     return {"date": date_str, "count": len(best), "signals": best}
 
@@ -110,14 +115,33 @@ def get_upcoming(days: int = 7) -> dict:
         row = dict(r)
         # Surface bookmaker over/under and home win odds if cached.
         row["odds"] = {
-            "home_win": db.get_odds(r["id"], "h2h", row["home_name"]),
-            "draw": db.get_odds(r["id"], "h2h", "Draw"),
-            "away_win": db.get_odds(r["id"], "h2h", row["away_name"]),
-            "over_2_5": db.get_odds(r["id"], "totals", "Over|2.5"),
-            "btts_yes": db.get_odds(r["id"], "btts", "Yes"),
+            "home_win": db.best_price(r["id"], "match_result", "home"),
+            "draw": db.best_price(r["id"], "match_result", "draw"),
+            "away_win": db.best_price(r["id"], "match_result", "away"),
+            "over_2_5": db.best_price(r["id"], "total_goals", "over", 2.5),
+            "btts_yes": db.best_price(r["id"], "btts", "yes"),
         }
         out.append(row)
     return {"count": len(out), "matches": out}
+
+
+@app.post("/matches/{match_id}/analyse")
+def analyse_match(match_id: int, refresh: bool = True, top: int = Query(default=10, ge=1, le=50)) -> dict:
+    """The one-click analysis: refresh both teams' recent history + lineups + odds
+    from every bookmaker for this fixture, then return the top value bets."""
+    result = analysis.analyse_match(match_id, refresh=refresh, top=top)
+    if result is None:
+        raise HTTPException(404, "match not found — run /ingest/refresh first")
+    return result
+
+
+@app.get("/matches/{match_id}/analysis")
+def get_match_analysis(match_id: int, top: int = Query(default=10, ge=1, le=50)) -> dict:
+    """Same as POST /analyse but uses cached data only (no API calls)."""
+    result = analysis.analyse_match(match_id, refresh=False, top=top)
+    if result is None:
+        raise HTTPException(404, "match not found")
+    return result
 
 
 @app.post("/ingest/refresh")
