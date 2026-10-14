@@ -32,7 +32,7 @@ to save credits.
 ## Daily paper picks
 
 `python -m backend.daily` ranks the day's best bets across every fixture in `TARGET_LEAGUES`: model probability
-above 50% and positive edge, top 10, printed as a table (`--json picks.json` saves the full result). It places
+above 50%, positive edge, and no more than 10 points above the bookmakers' consensus (`DAILY_MAX_MODEL_GAP`), top 10, printed as a table (`--json picks.json` saves the full result). It places
 no bets. It is built for API-Football Pro with The Odds API on its free plan:
 
 | Plan | Allowance | What a daily run spends |

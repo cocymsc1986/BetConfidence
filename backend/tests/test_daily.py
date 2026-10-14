@@ -67,20 +67,30 @@ def test_quota_header_caps_calls(tmp_db, monkeypatch):
     assert calls == []
 
 
-def test_pick_filters_probability_and_edge(league_db, monkeypatch):
-    # Long prices on everything for the upcoming match: some bets will show edge.
-    quotes = [
-        {"bookmaker": "bet365", "market": "match_result", "selection": s, "line": None, "price": pr}
-        for s, pr in (("home", 2.5), ("draw", 6.0), ("away", 12.0))
-    ] + [
-        {"bookmaker": "bet365", "market": "total_goals", "selection": s, "line": 2.5, "price": 2.4} for s in ("over", "under")
-    ]
+def test_pick_filters_probability_edge_and_gap(league_db, monkeypatch):
+    from backend.model import markets
+
+    model = {(p["market"], p["selection"], p["line"]): p["probability"]
+             for p in markets.predict_match(db.get_match(league_db))["predictions"] if not p["player"]}
+    home = model[("match_result", "home", None)]
+    over = model[("total_goals", "over", 2.5)]
+    # Margin-free prices: bookies 5 points below the model on goals (kept), 30 below on the home win (dropped).
+    def two_way(market, line, p_first, sels):
+        return [{"bookmaker": "bet365", "market": market, "selection": sel, "line": line, "price": 1 / q}
+                for sel, q in zip(sels, (p_first, 1 - p_first))]
+    quotes = two_way("total_goals", 2.5, over - 0.05, ("over", "under"))
+    rest = 1 - (home - 0.30)
+    quotes += [{"bookmaker": "bet365", "market": "match_result", "selection": sel, "line": None, "price": 1 / q}
+               for sel, q in (("home", home - 0.30), ("draw", rest / 2), ("away", rest / 2))]
     odds.store_quotes(league_db, "api-football", quotes)
     day = db.get_match(league_db)["date"][:10]
+
+    loose = daily.pick(day, top=10, min_prob=0.5, max_gap=1.0)
     picks = daily.pick(day, top=10, min_prob=0.5)
-    assert picks, "expected at least one pick"
+    assert {p["bet"] for p in picks} < {p["bet"] for p in loose}  # the home win is screened out
+    assert [p["market"] for p in picks] == ["total_goals"]
     assert all(p["probability"] > 0.5 and p["edge"] > 0 for p in picks)
-    assert [p["value_score"] for p in picks] == sorted((p["value_score"] for p in picks), reverse=True)
+    assert all(p["probability"] - p["market_prob"] <= daily.MAX_GAP for p in picks)
     assert "Paper picks" in daily._table({"date": day, "fixtures": 1, "picks": picks, "refresh": None})
 
 
