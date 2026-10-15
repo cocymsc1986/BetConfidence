@@ -31,6 +31,10 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from . import analysis, db, ingest, odds  # noqa: E402
 
 DAYS_BACK = int(os.getenv("DAILY_DAYS_BACK", "365"))
+# Largest gap allowed between the model's probability and the bookmakers' de-margined
+# consensus. A model 20+ points away from every bookmaker is far more often wrong
+# than right (e.g. teams from leagues it has never compared, in European ties).
+MAX_GAP = float(os.getenv("DAILY_MAX_MODEL_GAP", "0.10"))
 
 
 def refresh(date_str: str) -> dict[str, Any]:
@@ -50,8 +54,9 @@ def refresh(date_str: str) -> dict[str, Any]:
     return report
 
 
-def pick(date_str: str, *, top: int = 10, min_prob: float = 0.5) -> list[dict[str, Any]]:
-    """Best bets on `date_str` with model probability above `min_prob` and positive edge."""
+def pick(date_str: str, *, top: int = 10, min_prob: float = 0.5, max_gap: float = MAX_GAP) -> list[dict[str, Any]]:
+    """Best bets on `date_str` with model probability above `min_prob`, positive edge, and
+    no more than `max_gap` above the bookmakers' consensus (bets with no consensus are skipped)."""
     picks: list[dict[str, Any]] = []
     for m in db.matches_on(date_str):
         if m["status"] in db.FINISHED_STATUSES:
@@ -61,6 +66,8 @@ def pick(date_str: str, *, top: int = 10, min_prob: float = 0.5) -> list[dict[st
             continue
         for b in result["top_bets"]:
             if b["probability"] <= min_prob or (b.get("ev") or 0) <= 0:
+                continue
+            if b.get("market_prob") is None or b["probability"] - b["market_prob"] > max_gap:
                 continue
             picks.append({
                 "match_id": m["id"],
@@ -83,7 +90,8 @@ def pick(date_str: str, *, top: int = 10, min_prob: float = 0.5) -> list[dict[st
     return picks[:top]
 
 
-def run(date_str: str | None = None, *, top: int = 10, min_prob: float = 0.5, refresh_data: bool = True) -> dict[str, Any]:
+def run(date_str: str | None = None, *, top: int = 10, min_prob: float = 0.5, max_gap: float = MAX_GAP,
+        refresh_data: bool = True) -> dict[str, Any]:
     date_str = date_str or date.today().isoformat()
     db.init_db()
     report = refresh(date_str) if refresh_data else None
@@ -91,7 +99,7 @@ def run(date_str: str | None = None, *, top: int = 10, min_prob: float = 0.5, re
         "date": date_str,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "fixtures": len(db.matches_on(date_str)),
-        "picks": pick(date_str, top=top, min_prob=min_prob),
+        "picks": pick(date_str, top=top, min_prob=min_prob, max_gap=max_gap),
         "refresh": report,
     }
 
@@ -100,16 +108,16 @@ def _table(out: dict[str, Any]) -> str:
     lines = [
         f"Paper picks for {out['date']} ({out['fixtures']} fixtures)",
         "",
-        "| # | Match | Bet | Model % | Odds | Bookmaker | Edge |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| # | Match | Bet | Model % | Bookies % | Odds | Bookmaker | Edge |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for i, p in enumerate(out["picks"], 1):
         lines.append(
-            f"| {i} | {p['match']} | {p['bet']} | {100 * p['probability']:.0f}% | {p['odds']:.2f} "
+            f"| {i} | {p['match']} | {p['bet']} | {100 * p['probability']:.0f}% | {100 * p['market_prob']:.0f}% | {p['odds']:.2f} "
             f"| {p['bookmaker']} | {100 * p['edge']:+.1f}% |"
         )
     if not out["picks"]:
-        lines.append("| - | No bets above the thresholds today | | | | | |")
+        lines.append("| - | No bets above the thresholds today | | | | | | |")
     r = out.get("refresh")
     if r:
         lines += [
@@ -134,10 +142,12 @@ def main() -> None:
     ap.add_argument("--date", help="YYYY-MM-DD (default: today)")
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--min-prob", type=float, default=0.5)
+    ap.add_argument("--max-gap", type=float, default=MAX_GAP,
+                    help="max model probability above bookmaker consensus (default %(default)s)")
     ap.add_argument("--no-refresh", action="store_true", help="use cached data only (no API calls)")
     ap.add_argument("--json", help="also write the full result to this file")
     a = ap.parse_args()
-    out = run(a.date, top=a.top, min_prob=a.min_prob, refresh_data=not a.no_refresh)
+    out = run(a.date, top=a.top, min_prob=a.min_prob, max_gap=a.max_gap, refresh_data=not a.no_refresh)
     if a.json:
         Path(a.json).parent.mkdir(parents=True, exist_ok=True)
         Path(a.json).write_text(json.dumps(out, indent=2, default=str))
